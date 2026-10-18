@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { BaseRepository } from '../../common/base.repository';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { Prisma } from '@prisma/client';
@@ -31,17 +31,22 @@ export class OfferRepository extends BaseRepository {
       {};
 
     if (paymentMethodIds && paymentMethodIds.length > 0) {
+      const creatorId = offerData.creatorId as string;
+      const uniqueIds = [...new Set(paymentMethodIds)];
       const v2Methods = await this.prisma.paymentMethod.findMany({
-        where: { paymentId: { in: paymentMethodIds } },
+        where: {
+          paymentId: { in: uniqueIds },
+          userId: creatorId,
+          isActive: true,
+        },
         select: { paymentId: true },
       });
-      if (v2Methods.length > 0) {
-        connectPaymentMethods.connect = v2Methods.map(
-          (m: { paymentId: string }) => ({
-            paymentId: m.paymentId,
-          }),
-        );
+      if (v2Methods.length !== uniqueIds.length) {
+        throw new BadRequestException('Payment methods must be active and owned by the offer creator');
       }
+      connectPaymentMethods.connect = v2Methods.map(
+        (m: { paymentId: string }) => ({ paymentId: m.paymentId }),
+      );
     }
 
     const created = await this.prisma.offer.create({
@@ -57,8 +62,8 @@ export class OfferRepository extends BaseRepository {
   }
 
   async findById(offerId: string): Promise<OfferWithRelations | null> {
-    const offer = await this.prisma.offer.findUnique({
-      where: { offerId },
+    const offer = await this.prisma.offer.findFirst({
+      where: { offerId, creator: { deletedAt: null } },
       include: OFFER_DETAIL_INCLUDE,
     });
     return offer ? this.decryptPaymentMethods(offer) : null;
@@ -68,12 +73,14 @@ export class OfferRepository extends BaseRepository {
     where: Record<string, unknown>,
     skip = 0,
     take = 20,
+    sortBy: 'price' | 'createdAt' | 'offerId' = 'offerId',
+    sortOrder: 'asc' | 'desc' = 'desc',
   ): Promise<OfferWithRelations[]> {
     return this.prisma.offer.findMany({
-      where,
+      where: { ...where, creator: { deletedAt: null } },
       skip,
       take,
-      orderBy: { offerId: 'desc' },
+      orderBy: [{ [sortBy]: sortOrder }, { offerId: 'desc' }],
       include: OFFER_DETAIL_INCLUDE,
     }).then((offers) => offers.map((offer) => this.decryptPaymentMethods(offer)));
   }
@@ -85,6 +92,28 @@ export class OfferRepository extends BaseRepository {
       payment_methods: offer.payment_methods.map((method) =>
         this.paymentDataCipher.decryptFields(method as never),
       ),
+    };
+  }
+
+  async searchPage(
+    where: Record<string, unknown>,
+    skip = 0,
+    take = 20,
+    sortBy: 'price' | 'createdAt' | 'offerId' = 'offerId',
+    sortOrder: 'asc' | 'desc' = 'desc',
+  ) {
+    const [items, total] = await Promise.all([
+      this.search(where, skip, take, sortBy, sortOrder),
+      this.prisma.offer.count({ where: where as Prisma.OfferWhereInput }),
+    ]);
+    const hasMore = skip + items.length < total;
+    return {
+      items,
+      total,
+      skip,
+      take,
+      hasMore,
+      nextSkip: hasMore ? skip + items.length : null,
     };
   }
 }
